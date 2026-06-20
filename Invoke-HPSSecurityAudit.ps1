@@ -638,10 +638,11 @@ function Invoke-UserAudit {
         Add-MD "### 2.4 Stale Active Accounts (No Logon > 90 Days)"
         Add-MD ""
         Add-MDTable -Headers @('Name','Last Logon','Days Since Logon') -Rows (
-            $stale | ForEach-Object { 
-                @{ 
-                    Name='Last Logon'=$_.LastLogon.ToString('yyyy-MM-dd')
-                    'Days Since Logon'=((Get-Date) - $_.LastLogon).Days
+            $stale | ForEach-Object {
+                @{
+                    Name               = $_.Name
+                    'Last Logon'       = $_.LastLogon.ToString('yyyy-MM-dd')
+                    'Days Since Logon' = ((Get-Date) - $_.LastLogon).Days
                 }
             }
         )
