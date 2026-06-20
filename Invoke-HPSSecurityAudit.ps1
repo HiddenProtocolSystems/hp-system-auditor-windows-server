@@ -1890,38 +1890,35 @@ function Invoke-IOCHunt {
         }
     )
 
-    $suspiciousProcs = @(
-        'mimikatz','mimi','wce','fgdump','pwdump',
-        'psexec','psexesvc','remcos','njrat','asyncrat',
-        'cobaltstrike','beacon','empire','metasploit','meterpreter',
-        'nc','ncat','netcat','nbtscan','masscan','zmap',
-        'procdump','dumpert','nanodump',
-        'mshta','wscript','cscript','regsvr32','rundll32',
-        'certutil','bitsadmin','schtasks','at\.exe'
-    )
-
-    $foundSuspicious = $allProcs | Where-Object {
-        $n = $_.Name.ToLower()
-        $suspiciousProcs | Where-Object { $n -match $_ }
-    }
-
-    if ($foundSuspicious) {
-        foreach ($sp in $foundSuspicious) {
-            Write-Finding "SUSPICIOUS PROCESS: $($sp.Name) (PID $($sp.Id)) — Path: $($sp.Path)" IOC
+    # Process inventory — full list to report, behaviour checks only (no tool name matching)
+    Write-Status "Enumerating all running processes"
+    Add-MD "### 10.1 Running Process Inventory"
+    Add-MD ""
+    $allProcs = Get-Process | Sort-Object Name
+    Add-MDTable -Headers @('PID','Name','CPU (s)','Memory (MB)','Path') -Rows (
+        $allProcs | ForEach-Object {
+            @{
+                PID=$_.Id; Name=$_.Name
+                'CPU (s)'=[math]::Round($_.CPU, 2)
+                'Memory (MB)'=[math]::Round($_.WorkingSet/1MB, 1)
+                Path=if($_.Path){$_.Path}else{'(system/protected)'}
+            }
         }
-    } else {
-        Write-Finding "No known malicious process names detected" PASS
-    }
+    )
+    Write-Finding "Process inventory captured — $($allProcs.Count) running processes" INFO
 
-    # Processes running from unusual locations
+    # Processes from unusual filesystem paths — behaviour-based, no name matching
     Write-Status "Checking process executable paths for anomalies"
-    Add-MD "### 10.2 Processes from Unusual Paths"
+    Add-MD "### 10.2 Processes Executing from Unusual Paths"
     Add-MD ""
     $unusualProcs = $allProcs | Where-Object {
         $p = $_.Path
         $p -and (
             $p -match '\\Temp\\|\\AppData\\|\\ProgramData\\|\\Downloads\\|\\Desktop\\' -or
-            ($p -notmatch '^C:\\Windows\\' -and $p -notmatch '^C:\\Program Files' -and $p -notmatch '^C:\\Program Files \(x86\)' -and $p -notmatch 'System32')
+            ($p -notmatch '^C:\\Windows\\' -and
+             $p -notmatch '^C:\\Program Files' -and
+             $p -notmatch '^C:\\Program Files \(x86\)' -and
+             $p -notmatch 'System32')
         )
     }
     if ($unusualProcs) {
@@ -1929,39 +1926,101 @@ function Invoke-IOCHunt {
             $unusualProcs | ForEach-Object { @{ PID=$_.Id; Name=$_.Name; Path=$_.Path } }
         )
         foreach ($up in $unusualProcs) {
-            Write-Finding "Process '$($up.Name)' (PID $($up.Id)) executing from unusual path: $($up.Path)" IOC
+            Write-Finding "Process '$($up.Name)' (PID $($up.Id)) executing from non-standard path: $($up.Path)" IOC
         }
     } else {
-        Write-Finding "No processes found executing from unusual filesystem paths" PASS
+        Write-Finding "No processes found executing from non-standard filesystem paths" PASS
         Add-MD "*No unusual path processes.*"
     }
     Add-MD ""
 
-    # LOLBins usage check (Living Off the Land Binaries)
-    Write-Status "Checking for LOLBin activity in recent events"
-    Add-MD "### 10.3 Living Off the Land Binary (LOLBin) Activity"
+    # Process parent/child anomaly — processes that should never have children spawning them
+    Write-Status "Checking for anomalous parent-child process relationships"
+    Add-MD "### 10.3 Parent-Child Process Anomalies"
     Add-MD ""
-    $lolbins = @('mshta.exe','wscript.exe','cscript.exe','certutil.exe','bitsadmin.exe',
-                  'regsvr32.exe','msiexec.exe','installutil.exe','rundll32.exe',
-                  'forfiles.exe','pcalua.exe','regasm.exe','regsvcs.exe')
-
-    $lolbinEvents = Get-WinEvent -FilterHashtable @{ LogName='Security'; Id=4688; StartTime=(Get-Date).AddDays(-7) } -ErrorAction SilentlyContinue | Where-Object {
-        $msg = $_.Message
-        $lolbins | Where-Object { $msg -match $_ }
-    } | Select-Object -First 30
-
-    if ($lolbinEvents) {
-        Add-MDTable -Headers @('Time','Process') -Rows (
-            $lolbinEvents | ForEach-Object {
-                @{ Time=$_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'); Process=$_.Message.Substring(0,[Math]::Min(300,$_.Message.Length)) }
-            }
-        )
-        foreach ($lb in $lolbinEvents) {
-            Write-Finding "LOLBin execution detected in event log — review: $($lb.TimeCreated)" IOC
+    try {
+        $wmiProcs = Get-CimInstance Win32_Process -ErrorAction Stop
+        # Office/browser apps spawning shells is a red flag
+        $suspParents = @('winword','excel','powerpnt','outlook','iexplore','chrome','firefox','acrobat')
+        $shellChildren = @('powershell','cmd','wscript','cscript','mshta')
+        $anomalies = $wmiProcs | Where-Object {
+            $childName = $_.Name.ToLower() -replace '\.exe$',''
+            if ($childName -notin $shellChildren) { return $false }
+            $parentId   = $_.ParentProcessId
+            $parentProc = $wmiProcs | Where-Object { $_.ProcessId -eq $parentId } | Select-Object -First 1
+            if (-not $parentProc) { return $false }
+            $parentName = $parentProc.Name.ToLower() -replace '\.exe$',''
+            $parentName -in $suspParents
         }
-    } else {
-        Write-Finding "No LOLBin execution events found in security log (7 days)" PASS
-        Add-MD "*No LOLBin events found (note: process auditing may be required for full coverage).*"
+        if ($anomalies) {
+            Add-MDTable -Headers @('PID','Process','Parent PID','Parent Name','Command Line') -Rows (
+                $anomalies | ForEach-Object {
+                    $parentProc = $wmiProcs | Where-Object { $_.ProcessId -eq $_.ParentProcessId } | Select-Object -First 1
+                    @{
+                        PID=$_.ProcessId; Process=$_.Name
+                        'Parent PID'=$_.ParentProcessId
+                        'Parent Name'=if($parentProc){$parentProc.Name}else{'unknown'}
+                        'Command Line'=if($_.CommandLine){$_.CommandLine.Substring(0,[Math]::Min(200,$_.CommandLine.Length))}else{'N/A'}
+                    }
+                }
+            )
+            foreach ($a in $anomalies) { Write-Finding "Anomalous spawn: '$($a.Name)' (PID $($a.ProcessId)) spawned by document/browser process" IOC }
+        } else {
+            Write-Finding "No anomalous parent-child process relationships detected" PASS
+            Add-MD "*No anomalies detected.*"
+        }
+    } catch {
+        Write-Finding "Parent-child process check skipped: $($_.Exception.Message)" ERR
+    }
+    Add-MD ""
+
+    # LOLBin activity via event log process creation records — by event attribute not string match
+    Write-Status "Checking process creation events for interpreter/utility abuse (last 7 days)"
+    Add-MD "### 10.4 Interpreter & Utility Abuse (Event ID 4688)"
+    Add-MD ""
+    try {
+        # Pull process creation events and flag by CommandLine length anomalies and encoded args
+        $procEvents = Get-WinEvent -FilterHashtable @{
+            LogName   = 'Security'
+            Id        = 4688
+            StartTime = (Get-Date).AddDays(-7)
+        } -ErrorAction SilentlyContinue | Select-Object -First 100
+
+        if ($procEvents) {
+            $flaggedEvents = $procEvents | Where-Object {
+                $xml  = [xml]$_.ToXml()
+                $data = $xml.Event.EventData.Data
+                $cmd  = ($data | Where-Object { $_.Name -eq 'CommandLine' }).'#text'
+                # Flag base64 encoded commands, long obfuscated strings, download cradles
+                $cmd -match '-[Ee][Nn][Cc]|-[Ee][Nn][Cc][Oo][Dd]|FromBase64|DownloadString|DownloadFile|IEX|Invoke-Expression|WebClient' -or
+                ($cmd -and $cmd.Length -gt 500)
+            } | Select-Object -First 25
+
+            if ($flaggedEvents) {
+                Add-MDTable -Headers @('Time','New Process','Command Line (truncated)') -Rows (
+                    $flaggedEvents | ForEach-Object {
+                        $xml  = [xml]$_.ToXml()
+                        $data = $xml.Event.EventData.Data
+                        $proc = ($data | Where-Object { $_.Name -eq 'NewProcessName' }).'#text'
+                        $cmd  = ($data | Where-Object { $_.Name -eq 'CommandLine' }).'#text'
+                        @{
+                            Time=$_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')
+                            'New Process'=$proc
+                            'Command Line (truncated)'=if($cmd){$cmd.Substring(0,[Math]::Min(300,$cmd.Length))}else{'N/A'}
+                        }
+                    }
+                )
+                foreach ($fe in $flaggedEvents) { Write-Finding "Suspicious command-line pattern in process creation event at $($fe.TimeCreated)" IOC }
+            } else {
+                Write-Finding "No encoded/obfuscated command-line patterns in process creation events (7 days)" PASS
+                Add-MD "*No flagged events. Note: process auditing (Event ID 4688) must be enabled for full coverage.*"
+            }
+        } else {
+            Write-Finding "No process creation events found — enable Audit Process Creation policy for full visibility" WARN
+            Add-MD "*Event ID 4688 not available — enable Audit Process Creation in audit policy.*"
+        }
+    } catch {
+        Write-Finding "Process creation event check skipped: $($_.Exception.Message)" ERR
     }
     Add-MD ""
 
